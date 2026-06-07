@@ -1,23 +1,26 @@
 import io
+import os
 import time
 import telebot
+import psycopg2
 from collections import deque
 from PIL import Image
 from google import genai
 from google.genai import types
 
-import os
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_KEYS = [
     os.environ.get("GEMINI_API_KEY"),
     os.environ.get("GEMINI_API_KEY_2"),
 ]
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 current_key_index = 0
 
 def get_client():
     return genai.Client(api_key=GEMINI_KEYS[current_key_index])
-bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 
+bot   = telebot.TeleBot(TELEGRAM_TOKEN)
 MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = (
@@ -32,6 +35,87 @@ SYSTEM_PROMPT = (
     "Никогда не ставь точку в самом конце сообщения."
 )
 
+# ─── БАЗА ДАННЫХ ──────────────────────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_seen TIMESTAMP DEFAULT NOW(),
+            message_count INT DEFAULT 0
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def save_message(chat_id, role, content):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages (chat_id, role, content) VALUES (%s, %s, %s)",
+        (chat_id, role, content)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_history(chat_id, limit=20):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, content FROM messages WHERE chat_id=%s ORDER BY created_at DESC LIMIT %s",
+        (chat_id, limit)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return list(reversed(rows))
+
+def clear_history(chat_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM messages WHERE chat_id=%s", (chat_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def upsert_user(message):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (chat_id, username, first_name, last_seen, message_count)
+        VALUES (%s, %s, %s, NOW(), 1)
+        ON CONFLICT (chat_id) DO UPDATE
+        SET last_seen=NOW(),
+            username=EXCLUDED.username,
+            first_name=EXCLUDED.first_name,
+            message_count=users.message_count+1
+    """, (
+        message.chat.id,
+        message.from_user.username,
+        message.from_user.first_name
+    ))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# ─── RATE LIMIT ───────────────────────────────────────────────────────────────
 request_times         = deque()
 MAX_RPM               = 12
 MIN_DELAY_BETWEEN_REQ = 0.5
@@ -50,16 +134,7 @@ def rate_limit_wait():
             time.sleep(MIN_DELAY_BETWEEN_REQ - elapsed)
     request_times.append(time.time())
 
-sessions = {}
-
-def get_history(chat_id):
-    if chat_id not in sessions:
-        sessions[chat_id] = []
-    return sessions[chat_id]
-
-def add_to_history(chat_id, role, text):
-    sessions[chat_id].append({"role": role, "parts": [{"text": text}]})
-
+# ─── GEMINI ───────────────────────────────────────────────────────────────────
 def ask_gemini(contents, max_retries=6):
     global current_key_index
     for attempt in range(max_retries):
@@ -79,7 +154,6 @@ def ask_gemini(contents, max_retries=6):
         except Exception as e:
             err = str(e).lower()
             if "429" in err or "quota" in err or "rate" in err or "resource" in err:
-                # Переключаемся на другой ключ
                 current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
                 print(f"[Key Switch] переключились на ключ {current_key_index}")
                 time.sleep(3)
@@ -87,11 +161,11 @@ def ask_gemini(contents, max_retries=6):
             raise e
     return "оба ключа в лимите, подожди минуту"
 
-def build_contents(history, new_parts):
+def build_contents(history_rows, new_parts):
     contents = []
-    for turn in history:
+    for role, content in history_rows:
         contents.append(
-            types.Content(role=turn["role"], parts=[types.Part(text=p["text"]) for p in turn["parts"]])
+            types.Content(role=role, parts=[types.Part(text=content)])
         )
     contents.append(types.Content(role="user", parts=new_parts))
     return contents
@@ -104,17 +178,34 @@ def _image_to_bytes(image):
     image.save(buf, format=fmt)
     return buf.getvalue()
 
+# ─── ХЕНДЛЕРЫ ─────────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "Здарова братан! На связи Hosu. Чё как, чё притих?")
+    upsert_user(message)
+    name = message.from_user.first_name or "братан"
+    bot.reply_to(message, f"Здарова {name}! На связи Hosu. Чё как, чё притих?")
 
 @bot.message_handler(commands=['reset'])
 def reset_session(message):
-    sessions[message.chat.id] = []
+    clear_history(message.chat.id)
     bot.reply_to(message, "ок, начнём по новой, как будто не знакомы")
+
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT message_count, last_seen FROM users WHERE chat_id=%s", (message.chat.id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        bot.reply_to(message, f"ты написал {row[0]} сообщений, последний раз был {row[1].strftime('%d.%m.%Y %H:%M')}")
+    else:
+        bot.reply_to(message, "хз кто ты, напиши что-нибудь сначала")
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
+    upsert_user(message)
     try:
         photo     = message.photo[-1]
         file_info = bot.get_file(photo.file_id)
@@ -132,6 +223,7 @@ def handle_photo(message):
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
+    upsert_user(message)
     doc = message.document
     if doc.mime_type and doc.mime_type.startswith('image/'):
         try:
@@ -152,18 +244,21 @@ def handle_document(message):
 
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
+    upsert_user(message)
     chat_id = message.chat.id
-    history = get_history(chat_id)
     try:
+        history  = get_history(chat_id)
         contents = build_contents(history, [types.Part(text=message.text)])
         reply    = ask_gemini(contents)
-        add_to_history(chat_id, "user",  message.text)
-        add_to_history(chat_id, "model", reply)
+        save_message(chat_id, "user",  message.text)
+        save_message(chat_id, "model", reply)
         bot.reply_to(message, reply)
     except Exception as e:
         bot.reply_to(message, f"отвал кабеля: {str(e)}")
 
+# ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    init_db()
     print("Hosu ушел в Телегу...")
     while True:
         try:
