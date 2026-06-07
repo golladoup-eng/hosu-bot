@@ -8,9 +8,14 @@ from google.genai import types
 
 import os
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_KEYS = [
+    os.environ.get("GEMINI_API_KEY"),
+    os.environ.get("GEMINI_API_KEY_2"),
+]
+current_key_index = 0
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+def get_client():
+    return genai.Client(api_key=GEMINI_KEYS[current_key_index])
 bot    = telebot.TeleBot(TELEGRAM_TOKEN)
 
 MODEL = "gemini-2.5-flash"
@@ -55,10 +60,12 @@ def get_history(chat_id):
 def add_to_history(chat_id, role, text):
     sessions[chat_id].append({"role": role, "parts": [{"text": text}]})
 
-def ask_gemini(contents, max_retries=4):
+def ask_gemini(contents, max_retries=6):
+    global current_key_index
     for attempt in range(max_retries):
         try:
             rate_limit_wait()
+            client = get_client()
             response = client.models.generate_content(
                 model=MODEL,
                 contents=contents,
@@ -72,13 +79,13 @@ def ask_gemini(contents, max_retries=4):
         except Exception as e:
             err = str(e).lower()
             if "429" in err or "quota" in err or "rate" in err or "resource" in err:
-                if attempt < max_retries - 1:
-                    wait = 5 * (2 ** attempt)
-                    time.sleep(wait)
-                    continue
-                return "gemini задушил лимит, подожди минуту и пиши снова хз"
+                # Переключаемся на другой ключ
+                current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
+                print(f"[Key Switch] переключились на ключ {current_key_index}")
+                time.sleep(3)
+                continue
             raise e
-    return "чёт не пашет, попробуй ещё раз"
+    return "оба ключа в лимите, подожди минуту"
 
 def build_contents(history, new_parts):
     contents = []
