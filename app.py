@@ -278,7 +278,7 @@ if __name__ == "__main__":
     print("Hosu ушел в Телегу...")
     while True:
         try:
-            bot.polling(none_stop=True, interval=0, timeout=20)
+            bot.polling(none_stop=True, interval=0, timeout=20, long_polling_timeout=25)
         except Exception as e:
             print(f"Polling error: {e}")
             time.sleep(5)
