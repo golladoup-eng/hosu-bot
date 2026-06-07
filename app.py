@@ -135,14 +135,17 @@ def rate_limit_wait():
     request_times.append(time.time())
 
 # ─── GEMINI ───────────────────────────────────────────────────────────────────
+MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
+current_model_index = 0
+
 def ask_gemini(contents, max_retries=6):
-    global current_key_index
+    global current_key_index, current_model_index
     for attempt in range(max_retries):
         try:
             rate_limit_wait()
             client = get_client()
             response = client.models.generate_content(
-                model=MODEL,
+                model=MODELS[current_model_index],
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
@@ -155,11 +158,16 @@ def ask_gemini(contents, max_retries=6):
             err = str(e).lower()
             if "429" in err or "quota" in err or "rate" in err or "resource" in err:
                 current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
-                print(f"[Key Switch] переключились на ключ {current_key_index}")
+                print(f"[Key Switch] ключ {current_key_index}")
                 time.sleep(3)
                 continue
+            if "503" in err or "unavailable" in err or "overloaded" in err:
+                current_model_index = (current_model_index + 1) % len(MODELS)
+                print(f"[Model Switch] модель {MODELS[current_model_index]}")
+                time.sleep(2)
+                continue
             raise e
-    return "оба ключа в лимите, подожди минуту"
+    return "совсем всё лежит, попробуй через минуту"
 
 def build_contents(history_rows, new_parts):
     contents = []
