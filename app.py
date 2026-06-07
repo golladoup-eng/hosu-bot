@@ -138,7 +138,7 @@ def rate_limit_wait():
 MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
 current_model_index = 0
 
-def ask_gemini(contents, max_retries=6):
+def ask_gemini(contents, max_retries=4, message=None):
     global current_key_index, current_model_index
     for attempt in range(max_retries):
         try:
@@ -153,21 +153,29 @@ def ask_gemini(contents, max_retries=6):
                     top_p=0.95,
                 )
             )
+            # Если переключались — возвращаемся на основную модель
+            current_model_index = 0
             return response.text
         except Exception as e:
             err = str(e).lower()
             if "429" in err or "quota" in err or "rate" in err or "resource" in err:
                 current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
                 print(f"[Key Switch] ключ {current_key_index}")
-                time.sleep(3)
-                continue
-            if "503" in err or "unavailable" in err or "overloaded" in err:
-                current_model_index = (current_model_index + 1) % len(MODELS)
-                print(f"[Model Switch] модель {MODELS[current_model_index]}")
                 time.sleep(2)
                 continue
+            if "503" in err or "unavailable" in err or "overloaded" in err:
+                next_model = (current_model_index + 1) % len(MODELS)
+                current_model_index = next_model
+                print(f"[Model Switch] модель {MODELS[current_model_index]}")
+                if message and attempt == 1:
+                    try:
+                        bot.send_message(message.chat.id, "основная модель лежит, переключаюсь...")
+                    except:
+                        pass
+                time.sleep(1)
+                continue
             raise e
-    return "совсем всё лежит, попробуй через минуту"
+    return "gemini совсем лег, попробуй через 5 минут"
 
 def build_contents(history_rows, new_parts):
     contents = []
@@ -224,7 +232,7 @@ def handle_photo(message):
             types.Part(text=caption),
             types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=_image_to_bytes(image)))
         ]
-        reply = ask_gemini([types.Content(role="user", parts=parts)])
+        reply = ask_gemini([types.Content(role="user", parts=parts)], message=message)
         bot.reply_to(message, reply)
     except Exception as e:
         bot.reply_to(message, f"картинку не смог разглядеть: {str(e)}")
@@ -243,7 +251,7 @@ def handle_document(message):
                 types.Part(text=caption),
                 types.Part(inline_data=types.Blob(mime_type=doc.mime_type, data=_image_to_bytes(image)))
             ]
-            reply = ask_gemini([types.Content(role="user", parts=parts)])
+            reply = ask_gemini([types.Content(role="user", parts=parts)], message=message)
             bot.reply_to(message, reply)
         except Exception as e:
             bot.reply_to(message, f"файл не осилил: {str(e)}")
@@ -257,7 +265,7 @@ def handle_text(message):
     try:
         history  = get_history(chat_id)
         contents = build_contents(history, [types.Part(text=message.text)])
-        reply    = ask_gemini(contents)
+        reply = ask_gemini(contents, message=message)
         save_message(chat_id, "user",  message.text)
         save_message(chat_id, "model", reply)
         bot.reply_to(message, reply)
